@@ -112,6 +112,8 @@ codegraph --version
 
 MCP 配置和 `UserPromptSubmit` hook 用的都是裸命令 `codegraph`（走 PATH），`npm link` 只是在同一个 nvm bin 目录换符号链接，**路径不变，配置不用改**。
 
+**关于 `preuninstall`**：本包的 `preuninstall` 钩子（`dist/bin/uninstall.js`）会遍历所有 agent target 执行全局 `uninstall()`，也就是从 `~/.claude.json`、Cursor、Codex、opencode 里**删掉 codegraph 的 MCP 配置**。2026-07-27 实测：`npm link` 替换已有全局安装时**不会**触发它（npm 报 `removed 1 package` 但配置完好无损）。不过 `npm uninstall -g` 一定会触发——**手动卸载前先备份那几个配置文件**。
+
 回滚：`./scripts/local-install.sh --undo`
 
 **什么时候会咬人**：
