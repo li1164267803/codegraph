@@ -35,6 +35,35 @@ function configureConnection(db: SqliteDatabase): void {
   db.pragma('cache_size = -64000');      // 64 MB page cache
   db.pragma('temp_store = MEMORY');      // temp tables in memory
   db.pragma('mmap_size = 268435456');    // 256 MB memory-mapped I/O
+  // Without a journal_size_limit the -wal file never shrinks below its
+  // high-water mark while a connection lives: checkpoints fold frames back but
+  // leave the file at full size, so one giant deferred-sync WAL stays giant
+  // forever. With the limit set, any checkpoint that resets the WAL truncates
+  // the file back down. Killed-process leftovers are handled separately by
+  // healOversizedWal() at open. (#1431)
+  db.pragma(`journal_size_limit = ${WAL_HEAL_THRESHOLD_BYTES}`);
+}
+
+/**
+ * WAL size past which `healOversizedWal` (run at every `open`) checkpoints and
+ * truncates the file, and to which `journal_size_limit` clips the WAL after any
+ * resetting checkpoint. A SIGKILL'd process (the #850 liveness watchdog, OOM,
+ * crash) can leave an arbitrarily large WAL behind — a whole deferred-sync
+ * run's worth (#1248) — and before #1431 no later session ever shrank it: the
+ * file just grew, killed session after killed session, until the disk filled
+ * (25.6 GB observed). 64 MB is far above anything a healthy open ever sees
+ * (a clean close deletes the WAL) yet small enough to cap the leak.
+ * Override with `CODEGRAPH_WAL_HEAL_MB` (also feeds `journal_size_limit`).
+ */
+export const WAL_HEAL_THRESHOLD_BYTES = resolveWalHealBytes(process.env.CODEGRAPH_WAL_HEAL_MB);
+
+/** Resolve the heal threshold from the env override (MB); invalid ⇒ 64 MB. */
+export function resolveWalHealBytes(envVal: string | undefined): number {
+  if (envVal !== undefined && envVal !== '') {
+    const n = Number(envVal);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n * 1024 * 1024);
+  }
+  return 64 * 1024 * 1024;
 }
 
 /**
@@ -54,10 +83,17 @@ export class DatabaseConnection {
    */
   private openedInode: string | null;
 
-  private constructor(db: SqliteDatabase, dbPath: string, backend: SqliteBackend) {
+  /**
+   * Whether FTS5 is available in this Node.js build. When false, search
+   * falls back to LIKE + fuzzy matching (#1532).
+   */
+  readonly fts5Available: boolean;
+
+  private constructor(db: SqliteDatabase, dbPath: string, backend: SqliteBackend, fts5Available: boolean) {
     this.db = db;
     this.dbPath = dbPath;
     this.backend = backend;
+    this.fts5Available = fts5Available;
     this.openedInode = statInode(dbPath);
   }
 
@@ -76,10 +112,41 @@ export class DatabaseConnection {
 
     configureConnection(db);
 
-    // Run schema initialization
+    // Run schema initialization, splitting FTS5 from the rest so
+    // codegraph still works when Node.js was built without FTS5 (#1532).
     const schemaPath = path.join(__dirname, 'schema.sql');
     const schema = fs.readFileSync(schemaPath, 'utf-8');
-    db.exec(schema);
+
+    const FTS5_MARKER = '-- Full-text search index on node names, docstrings, and signatures';
+    const ftsIdx = schema.indexOf(FTS5_MARKER);
+    let fts5Available = true;
+
+    if (ftsIdx >= 0) {
+      const preFts = schema.slice(0, ftsIdx);
+      // FTS ends after the update trigger; required tables and indexes follow
+      // it in schema.sql and must still be created when FTS5 is unavailable.
+      const ftsSection = schema.slice(ftsIdx).match(
+        /^[\s\S]*?CREATE TRIGGER IF NOT EXISTS nodes_au\b[\s\S]*?END;/
+      )?.[0];
+      if (!ftsSection) throw new Error('schema.sql: FTS5 update trigger not found');
+      // Execute everything before FTS5 first
+      db.exec(preFts);
+      // Try FTS5; if it fails, skip it and continue with LIKE-only search
+      try {
+        db.exec(ftsSection);
+      } catch (err: any) {
+        fts5Available = false;
+        const msg = err?.message ?? String(err);
+        console.warn(
+          `[codegraph] FTS5 not available in this Node.js build (${msg}). ` +
+          `Search will fall back to LIKE + fuzzy matching. ` +
+          `For full-text search, use a Node.js build with FTS5 enabled.`
+        );
+      }
+      db.exec(schema.slice(ftsIdx + ftsSection.length));
+    } else {
+      db.exec(schema);
+    }
 
     // Record current schema version so migrations aren't re-applied on open
     const currentVersion = getCurrentVersion(db);
@@ -89,7 +156,7 @@ export class DatabaseConnection {
       ).run(CURRENT_SCHEMA_VERSION, Date.now(), 'Initial schema includes all migrations');
     }
 
-    return new DatabaseConnection(db, dbPath, backend);
+    return new DatabaseConnection(db, dbPath, backend, fts5Available);
   }
 
   /**
@@ -104,8 +171,16 @@ export class DatabaseConnection {
 
     configureConnection(db);
 
+    // Detect FTS5 availability for search fallback (#1532)
+    let fts5Available = true;
+    try {
+      db.exec("SELECT * FROM nodes_fts LIMIT 0");
+    } catch {
+      fts5Available = false;
+    }
+
     // Check and run migrations if needed
-    const conn = new DatabaseConnection(db, dbPath, backend);
+    const conn = new DatabaseConnection(db, dbPath, backend, fts5Available);
     const currentVersion = getCurrentVersion(db);
 
     if (currentVersion < CURRENT_SCHEMA_VERSION) {
@@ -116,6 +191,11 @@ export class DatabaseConnection {
     // beginBulkNodeLoad and endBulkNodeLoad): the FTS triggers are missing and
     // nodes_fts is stale. Rebuild + recreate so search stays in sync.
     conn.healBulkNodeLoad();
+    conn.healBulkSecondaryIndexes();
+
+    // Self-heal a killed session's leftover oversized WAL (#1431) — one
+    // statSync when healthy, off-thread checkpoint+truncate when not.
+    void conn.healOversizedWal();
 
     return conn;
   }
@@ -135,6 +215,7 @@ export class DatabaseConnection {
    * row written by anyone during the window is captured by the rebuild.
    */
   beginBulkNodeLoad(): void {
+    if (!this.fts5Available) return;
     for (const t of DatabaseConnection.FTS_TRIGGER_NAMES) {
       this.db.exec(`DROP TRIGGER IF EXISTS ${t}`);
     }
@@ -147,6 +228,7 @@ export class DatabaseConnection {
    * IF NOT EXISTS).
    */
   endBulkNodeLoad(): void {
+    if (!this.fts5Available) return;
     this.db.exec(`INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')`);
     this.recreateFtsTriggers();
   }
@@ -321,6 +403,7 @@ export class DatabaseConnection {
 
   /** Recreate the FTS triggers + rebuild if a bulk-load window never closed. */
   private healBulkNodeLoad(): void {
+    if (!this.fts5Available) return;
     const row = this.db
       .prepare(
         `SELECT count(*) AS c FROM sqlite_master WHERE type = 'trigger' AND name IN ('nodes_ai','nodes_ad','nodes_au')`
@@ -328,6 +411,28 @@ export class DatabaseConnection {
       .get() as { c: number } | undefined;
     if ((row?.c ?? 0) >= DatabaseConnection.FTS_TRIGGER_NAMES.length) return;
     this.endBulkNodeLoad();
+  }
+
+  /** Recreate every secondary index a killed bulk parse/ref/edge window may leave dropped. */
+  private healBulkSecondaryIndexes(): void {
+    const names = [...new Set<string>([
+      ...DatabaseConnection.BULK_PARSE_INDEX_NAMES,
+      ...DatabaseConnection.BULK_REF_INDEX_NAMES,
+      ...DatabaseConnection.BULK_EDGE_INDEX_NAMES,
+    ])];
+    const placeholders = names.map(() => '?').join(',');
+    const row = this.db
+      .prepare(`SELECT count(*) AS c FROM sqlite_master WHERE type = 'index' AND name IN (${placeholders})`)
+      .get(...names) as { c: number } | undefined;
+    if ((row?.c ?? 0) >= names.length) return;
+
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    for (const idx of names) {
+      const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
+      if (!m) throw new Error(`schema.sql: index ${idx} not found for crash recovery`);
+      this.db.exec(m[0]);
+    }
   }
 
   /**
@@ -504,6 +609,52 @@ export class DatabaseConnection {
    */
   async checkpointWalTruncate(): Promise<{ busy: number; log: number; checkpointed: number } | null> {
     return this.checkpointWal('TRUNCATE');
+  }
+
+  /**
+   * Shrink a leftover oversized WAL (#1431). A SIGKILL'd session — the #850
+   * liveness watchdog, OOM, a crash — leaves its WAL on disk, the next session
+   * appends to the same file, and (pre-#1431) nothing ever truncated it:
+   * PASSIVE checkpoints fold frames but keep the file at its high-water mark,
+   * and the one shrinking path (a clean last-connection close) is exactly what
+   * the killed world never takes. Unbounded growth until the disk fills.
+   *
+   * Called fire-and-forget from every `open()`: cost is one statSync when the
+   * WAL is small (the overwhelmingly common case). Past the threshold it runs
+   * the off-thread PASSIVE fold then TRUNCATE — both on worker connections
+   * with a busy_timeout, so a racing writer degrades this to a no-op that the
+   * next open retries rather than a stall.
+   */
+  async healOversizedWal(): Promise<{ healed: boolean; beforeBytes: number; afterBytes: number }> {
+    const beforeBytes = this.getWalSizeBytes();
+    if (beforeBytes <= WAL_HEAL_THRESHOLD_BYTES) {
+      return { healed: false, beforeBytes, afterBytes: beforeBytes };
+    }
+    // Single-flight: open() fires this fire-and-forget and callers may also
+    // invoke it explicitly. Two concurrent passes DEFEAT each other — each
+    // checkpoint worker sees the other as a busy reader and no-ops — so share
+    // one in-flight pass instead of racing.
+    this.walHeal ??= this.runWalHeal(beforeBytes).finally(() => { this.walHeal = null; });
+    return this.walHeal;
+  }
+
+  private walHeal: Promise<{ healed: boolean; beforeBytes: number; afterBytes: number }> | null = null;
+
+  private async runWalHeal(beforeBytes: number): Promise<{ healed: boolean; beforeBytes: number; afterBytes: number }> {
+    // A racing reader/writer (another session healing the same file, a query
+    // pool warming up) degrades a checkpoint pass to a busy no-op — retry a
+    // few times before leaving the rest to the next open.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 300));
+      await this.checkpointWalPassive();
+      await this.checkpointWalTruncate();
+      if (this.getWalSizeBytes() <= WAL_HEAL_THRESHOLD_BYTES) break;
+    }
+    const afterBytes = this.getWalSizeBytes();
+    if (process.env.CODEGRAPH_WAL_VALVE_DEBUG) {
+      console.error(`[wal-heal] oversized WAL at open: ${Math.round(beforeBytes / (1024 * 1024))}MB -> ${Math.round(afterBytes / (1024 * 1024))}MB`);
+    }
+    return { healed: afterBytes < beforeBytes, beforeBytes, afterBytes };
   }
 
   private async checkpointWal(mode: 'PASSIVE' | 'TRUNCATE'): Promise<{ busy: number; log: number; checkpointed: number } | null> {
